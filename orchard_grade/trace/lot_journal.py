@@ -10,6 +10,7 @@ from typing import Any, Iterator, Mapping, Sequence
 from orchard_grade.contracts.batches import Decision, DomainRecord, ContractError, canonical_json, stable_hash, utc_now
 from orchard_grade.inspection.receipts import InspectionReceipt, prepare_receipts, record_receipt, receipts_for_lot
 from orchard_grade.operations.packhouse_queue import QueueAssignment, assign_released_lot, prepare_queue
+from orchard_grade.exports.packhouse import delivery_fingerprint, verify_artifacts, verify_bundle
 
 
 SCHEMA = """
@@ -61,6 +62,14 @@ CREATE TABLE IF NOT EXISTS runs(
     result_json TEXT NOT NULL,
     started_at TEXT NOT NULL,
     finished_at TEXT
+);
+CREATE TABLE IF NOT EXISTS deliveries(
+    run_id TEXT PRIMARY KEY,
+    status TEXT NOT NULL,
+    delivery_hash TEXT NOT NULL,
+    artifacts_json TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY(run_id) REFERENCES runs(run_id)
 );
 CREATE INDEX IF NOT EXISTS idx_records_state ON records(state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_events_aggregate ON events(aggregate_id, event_id);
@@ -128,6 +137,32 @@ class Repository:
                 raise
             finally:
                 connection.close()
+
+    @contextmanager
+    def processing(self, fixture_hash: str) -> Iterator[None]:
+        """Serialise the first delivery of one batch across threads and processes.
+
+        Holding this lock for the whole processing run means a second team
+        asking for the same batch waits and then restores the frozen result
+        instead of advancing the grading workflow a second time.
+        """
+        with self._lock:
+            lock_path = Path(f"{self.database}.{stable_hash({'fixture': fixture_hash})[:24]}.lock")
+            handle = open(lock_path, "a+b")
+            try:
+                try:
+                    import fcntl
+                except ImportError:  # pragma: no cover - non-POSIX platforms
+                    fcntl = None
+                if fcntl is not None:
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    if fcntl is not None:
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            finally:
+                handle.close()
 
     def _last_hash(self, connection: sqlite3.Connection) -> str:
         row = connection.execute("SELECT event_hash FROM events ORDER BY event_id DESC LIMIT 1").fetchone()
@@ -231,18 +266,153 @@ class Repository:
             row = connection.execute("SELECT status,result_json FROM runs WHERE run_id=?", (run_id,)).fetchone()
         if not row or row["status"] != "finished":
             return None
-        result = json.loads(row["result_json"])
+        try:
+            result = json.loads(row["result_json"])
+        except (TypeError, ValueError) as exc:
+            raise ContractError("stored run result is invalid") from exc
         if not isinstance(result, dict):
             raise ContractError("stored run result is invalid")
         return result
 
-    def finish_run(self, run_id: str, result: Mapping[str, Any]) -> None:
+    def interrupted_run_evidence(self, run_id: str, records: Sequence[DomainRecord]) -> list[str]:
+        """Report whether an earlier attempt already advanced this run's grading.
+
+        A run that never froze its delivery cannot be resumed safely: re-running
+        the decision sequence would advance batches a second time.  Detecting
+        that evidence lets the caller refuse instead of changing conclusions.
+        """
+        with self.connect() as connection:
+            row = connection.execute("SELECT status,started_at FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if row is None or row["status"] != "running":
+                return []
+            started_at = row["started_at"]
+            stored = {item["record_id"]: item for item in connection.execute(
+                "SELECT record_id,version,state,payload_json,updated_at FROM records WHERE record_id IN (%s)"
+                % ",".join("?" * len(records)), [record.record_id for record in records])}
+            decided_at = {item[0] for item in connection.execute(
+                "SELECT DISTINCT record_id FROM decisions WHERE decided_at>=? AND record_id IN (%s)"
+                % ",".join("?" * len(records)), [started_at, *(record.record_id for record in records)])}
+        evidence: list[str] = []
+        for record in records:
+            current = stored.get(record.record_id)
+            if current is None:
+                continue
+            advanced = (current["version"] != record.version or current["state"] != record.state
+                        or json.loads(current["payload_json"]) != record.payload)
+            if advanced and current["updated_at"] >= started_at:
+                evidence.append(f"record {record.record_id} was advanced by the interrupted attempt")
+            if record.record_id in decided_at:
+                evidence.append(f"record {record.record_id} already has a decision from the interrupted attempt")
+        return evidence
+
+    def finish_run(self, run_id: str, result: Mapping[str, Any], artifacts: Mapping[str, Any] | None = None) -> None:
+        """Mark the run finished and freeze its delivery material atomically."""
+        body = None
+        delivery_hash = None
+        if artifacts is not None:
+            body = canonical_json(dict(artifacts))
+            delivery_hash = delivery_fingerprint(artifacts)
         with self.transaction() as connection:
+            row = connection.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if row is not None and row["status"] == "finished":
+                if artifacts is not None:
+                    self._check_delivery_unchanged(connection, run_id, delivery_hash)
+                return
             changed = connection.execute("UPDATE runs SET status='finished',result_json=?,finished_at=? WHERE run_id=?",
                                          (canonical_json(result), utc_now(), run_id)).rowcount
             if changed != 1:
                 raise ContractError("unknown run")
             self.append_event(connection, "run.finished", run_id, 1, dict(result))
+            if body is not None:
+                self._insert_delivery(connection, run_id, artifacts, delivery_hash, body)
+
+    def _check_delivery_unchanged(self, connection: sqlite3.Connection, run_id: str, delivery_hash: str) -> None:
+        row = connection.execute("SELECT status,delivery_hash FROM deliveries WHERE run_id=?", (run_id,)).fetchone()
+        if row is None or row["delivery_hash"] != delivery_hash or row["status"] != "ready":
+            raise ContractError("delivery material for this run is already recorded and cannot be replaced")
+
+    def _insert_delivery(self, connection: sqlite3.Connection, run_id: str,
+                         artifacts: Mapping[str, Any], delivery_hash: str, body: str) -> None:
+        connection.execute("INSERT INTO deliveries(run_id,status,delivery_hash,artifacts_json,created_at) VALUES(?,?,?,?,?)",
+                           (run_id, "ready", delivery_hash, body, utc_now()))
+        self.append_event(connection, "delivery.recorded", run_id, 1,
+                          {"delivery_hash": delivery_hash,
+                           "manifest_hash": artifacts.get("manifest", {}).get("manifest_hash")})
+
+    def save_delivery(self, run_id: str, artifacts: Mapping[str, Any]) -> bool:
+        """Freeze the deliverable material of a processing run exactly once.
+
+        The stored copy is what later deliveries are restored from, so a
+        database that was revised after the run can never masquerade as the
+        original result.  A second identical save is idempotent; any attempt
+        to replace the material of a finished run is rejected.
+        """
+        body = canonical_json(dict(artifacts))
+        delivery_hash = delivery_fingerprint(artifacts)
+        with self.transaction() as connection:
+            row = connection.execute("SELECT status,delivery_hash FROM deliveries WHERE run_id=?",
+                                     (run_id,)).fetchone()
+            if row is not None:
+                if row["delivery_hash"] == delivery_hash and row["status"] == "ready":
+                    return False
+                raise ContractError("delivery material for this run is already recorded and cannot be replaced")
+            run = connection.execute("SELECT status FROM runs WHERE run_id=?", (run_id,)).fetchone()
+            if run is None:
+                raise ContractError("delivery material requires an existing run")
+            self._insert_delivery(connection, run_id, artifacts, delivery_hash, body)
+        return True
+
+    def _delivery_row(self, run_id: str) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT status,delivery_hash,artifacts_json FROM deliveries WHERE run_id=?",
+                                     (run_id,)).fetchone()
+        if row is None:
+            return None
+        try:
+            artifacts = json.loads(row["artifacts_json"])
+        except (TypeError, ValueError) as exc:
+            return {"status": "corrupt", "delivery_hash": row["delivery_hash"], "artifacts": None,
+                    "errors": [f"stored delivery material is unreadable: {exc}"]}
+        return {"status": row["status"], "delivery_hash": row["delivery_hash"], "artifacts": artifacts}
+
+    def delivery_material(self, run_id: str) -> tuple[dict[str, Any], list[str]]:
+        """Return trustworthy frozen delivery material for a run.
+
+        Partial writes, damaged rows and material that no longer matches its
+        recorded hash are reported instead of being used or silently ignored.
+        The classification never depends on the current contents of the live
+        records, decisions or events tables.
+        """
+        row = self._delivery_row(run_id)
+        if row is None:
+            raise ContractError("no frozen delivery material exists for this run")
+        if row.get("artifacts") is None:
+            raise ContractError("; ".join(row.get("errors") or ["delivery material is unreadable"]))
+        artifacts = row["artifacts"]
+        errors = verify_artifacts(artifacts)
+        if row["delivery_hash"] != artifacts.get("delivery_hash"):
+            errors.append("stored delivery hash disagrees with the delivery material")
+        if row["status"] != "ready":
+            errors.append("delivery material is not marked ready")
+        if errors:
+            raise ContractError("frozen delivery material failed verification: " + "; ".join(errors))
+        return artifacts, []
+
+    def delivery_report(self, run_id: str) -> dict[str, Any] | None:
+        row = self._delivery_row(run_id)
+        if row is None:
+            return None
+        material_errors: list[str] = []
+        if row.get("artifacts") is None:
+            material_errors = row.get("errors") or ["delivery material is unreadable"]
+        else:
+            material_errors = verify_artifacts(row["artifacts"])
+            if row["delivery_hash"] != row["artifacts"].get("delivery_hash"):
+                material_errors.append("stored delivery hash disagrees with the delivery material")
+        if row["status"] != "ready":
+            material_errors.append("delivery material is not marked ready")
+        return {"run_id": run_id, "status": row["status"], "delivery_hash": row["delivery_hash"],
+                "trusted": not material_errors, "errors": material_errors}
 
     def verify_chain(self) -> list[str]:
         errors: list[str] = []
@@ -250,7 +420,12 @@ class Repository:
         with self.connect() as connection:
             rows = connection.execute("SELECT * FROM events ORDER BY event_id").fetchall()
         for row in rows:
-            payload = json.loads(row["payload_json"])
+            try:
+                payload = json.loads(row["payload_json"])
+            except (TypeError, ValueError):
+                errors.append(f"event {row['event_id']} payload is unreadable")
+                previous = row["event_hash"]
+                continue
             expected = stable_hash({"event_type": row["event_type"], "aggregate_id": row["aggregate_id"],
                                     "aggregate_version": row["aggregate_version"], "payload": payload,
                                     "previous_hash": row["previous_hash"], "created_at": row["created_at"]})
@@ -260,6 +435,30 @@ class Repository:
                 errors.append(f"event {row['event_id']} content hash mismatch")
             previous = row["event_hash"]
         return errors
+
+    def verify(self, output: str | Path) -> dict[str, Any]:
+        """Cross-check the database, the delivery in ``output`` and the frozen material."""
+        errors = self.verify_chain()
+        bundle_errors = verify_bundle(output)
+        delivery = None
+        manifest = None
+        try:
+            manifest = json.loads((Path(output) / "manifest.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = None
+        if isinstance(manifest, dict) and manifest.get("run_id"):
+            delivery = self.delivery_report(str(manifest["run_id"]))
+            if delivery is None:
+                delivery = {"run_id": manifest["run_id"], "status": "missing", "trusted": False,
+                            "delivery_hash": manifest.get("delivery_hash"),
+                            "errors": ["no frozen delivery material exists for this run"]}
+            elif delivery["delivery_hash"] != manifest.get("delivery_hash"):
+                delivery = dict(delivery) | {"trusted": False,
+                                             "errors": list(delivery["errors"]) + ["delivery belongs to another processing run"]}
+        delivery_ok = True if delivery is None else bool(delivery.get("trusted"))
+        return {"ok": not errors and not bundle_errors and delivery_ok,
+                "chain_errors": errors, "bundle_errors": bundle_errors,
+                "delivery": delivery, "snapshot": self.snapshot()}
 
     def snapshot(self) -> dict[str, Any]:
         with self.connect() as connection:

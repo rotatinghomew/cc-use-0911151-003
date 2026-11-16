@@ -10,8 +10,19 @@
 运行验收：
 python3 -m orchard_grade run --fixture fixtures/acceptance.json --database /tmp/orchard_grade.sqlite3 --output /tmp/orchard_grade-output
 
+相同批次再次运行（或 --output 指向新目录）时，不重新推进分选：交付由该次运行
+结束时冻结的统计、批次状态与审计依据恢复，因此后来修订过的数据库内容不会被
+当作当时结果。已存在的可信文件原样保留，缺失、损坏或只写出一部分的文件会重建
+并在结果的 delivery 字段（trusted_files / created_files / repaired_files /
+needs_reverification）中列明；恢复未完整核验前不会返回成功。两个班组同时请求
+同一批次时，一方生成交付、另一方等待并恢复同一交付。冻结材料损坏或首次处理
+中断时恢复失败，已生效的分选结论保持不变，并明确要求重新核验。首次交付时才
+会推进分选；同一输出目录不会被另一次处理的交付覆盖。
+
 核验：
 python3 -m orchard_grade verify --database /tmp/orchard_grade.sqlite3 --output /tmp/orchard_grade-output
+（同时核对审计链、目录文件哈希以及 delivery.run_id / delivery_hash 是否与
+数据库中该次处理的冻结交付一致，重启后仍一致。）
 
 全量测试：
 python3 -m unittest discover -s tests -v
